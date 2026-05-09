@@ -1,11 +1,14 @@
 import Foundation
 import SQLite
 
+// @unchecked Sendable is justified: all database access is serialized via `lock`.
 public final class SwiftLiteDB: @unchecked Sendable {
     private var db: Connection?
     private let dbName: String
     private let dbPath: String
-    
+    // NSRecursiveLock allows re-entrant locking on the same thread (needed inside transactions).
+    private let lock = NSRecursiveLock()
+
     public var enableLocationTracking: Bool = false
     public var enableLogging: Bool = false
     public var enableDebugMode: Bool = false {
@@ -16,12 +19,12 @@ public final class SwiftLiteDB: @unchecked Sendable {
             }
         }
     }
-    
+
     public var databasePath: String? {
         guard enableLocationTracking else { return nil }
         return dbPath
     }
-    
+
     public init(name: String) throws {
         self.dbName = name
         let fileManager = FileManager.default
@@ -29,81 +32,72 @@ public final class SwiftLiteDB: @unchecked Sendable {
         self.dbPath = documentsPath.appendingPathComponent("\(dbName).sqlite").path
         try setupDatabase()
     }
-    
+
     private func setupDatabase() throws {
         db = try Connection(dbPath)
         if enableLogging {
             print("Database initialized at: \(dbPath)")
         }
     }
-    
+
     public func createTable(name: String, columns: [String], foreignKeys: [ForeignKey]? = nil) throws {
         guard let db = db else { throw SwiftLiteDBError.databaseNotInitialized }
-        
+
+        // Table/column names are schema identifiers from code, not user data — DDL cannot use ? bindings.
         var sql = "CREATE TABLE IF NOT EXISTS \(name) ("
         sql += columns.joined(separator: ", ")
-        
+
         if let foreignKeys = foreignKeys, !foreignKeys.isEmpty {
             sql += ", "
             sql += foreignKeys.map { $0.sqlString() }.joined(separator: ", ")
         }
-        
+
         sql += ")"
-        
-        if enableLogging {
-            print("Executing SQL: \(sql)")
-        }
-        
+
+        if enableLogging { print("Executing SQL: \(sql)") }
+
+        lock.lock()
+        defer { lock.unlock() }
         try db.execute(sql)
     }
-    
+
     public func insert(into table: String, values: [String: Any]) throws {
         guard let db = db else { throw SwiftLiteDBError.databaseNotInitialized }
-        
+
         let columns = values.keys.joined(separator: ", ")
         let placeholders = Array(repeating: "?", count: values.count).joined(separator: ", ")
         let sql = "INSERT INTO \(table) (\(columns)) VALUES (\(placeholders))"
-        
+
         if enableLogging {
             print("Executing SQL: \(sql)")
             print("With values: \(values)")
         }
-        
-        let bindingValues = values.values.compactMap { value -> Binding? in
-            if let stringValue = value as? String {
-                return stringValue
-            } else if let intValue = value as? Int {
-                return Int64(intValue)
-            } else if let int64Value = value as? Int64 {
-                return int64Value
-            } else if let doubleValue = value as? Double {
-                return doubleValue
-            } else if let boolValue = value as? Bool {
-                return boolValue
-            } else if value is NSNull {
-                return nil
-            }
-            return nil
-        }
-        
+
+        let bindingValues = values.values.compactMap { anyToBinding($0) }
+
+        lock.lock()
+        defer { lock.unlock() }
         try db.run(sql, bindingValues)
     }
-    
-    public func query(from table: String, where condition: String? = nil) throws -> [[String: Any]] {
+
+    /// Query rows from a table. Use `?` placeholders in `condition` and pass values in `parameters`.
+    public func query(from table: String, where condition: String? = nil, parameters: [Any] = []) throws -> [[String: Any]] {
         guard let db = db else { throw SwiftLiteDBError.databaseNotInitialized }
-        
+
         var sql = "SELECT * FROM \(table)"
         if let condition = condition {
             sql += " WHERE \(condition)"
         }
-        
-        if enableLogging {
-            print("Executing SQL: \(sql)")
-        }
-        
+
+        if enableLogging { print("Executing SQL: \(sql)") }
+
+        let bindingParams = parameters.compactMap { anyToBinding($0) }
+
+        lock.lock()
+        defer { lock.unlock() }
+
         var results: [[String: Any]] = []
-        let statement = try db.prepare(sql)
-        
+        let statement = try db.prepare(sql, bindingParams)
         for row in statement {
             var dict: [String: Any] = [:]
             for (index, name) in statement.columnNames.enumerated() {
@@ -111,46 +105,34 @@ public final class SwiftLiteDB: @unchecked Sendable {
             }
             results.append(dict)
         }
-        
         return results
     }
-    
+
     public func transaction(_ block: (SwiftLiteDB) throws -> Void) throws {
         guard let db = db else { throw SwiftLiteDBError.databaseNotInitialized }
-        
+
+        lock.lock()
+        defer { lock.unlock() }
         try db.transaction {
             try block(self)
         }
     }
-    
+
     public func execute(_ sql: String, parameters: [Any]? = nil) throws -> [[String: Any]] {
         guard let db = db else { throw SwiftLiteDBError.databaseNotInitialized }
-        
+
         if enableLogging {
             print("Executing SQL: \(sql)")
-            if let parameters = parameters {
-                print("With parameters: \(parameters)")
-            }
+            if let parameters = parameters { print("With parameters: \(parameters)") }
         }
-        
-        let bindingParams = parameters?.compactMap { param -> Binding? in
-            if let stringValue = param as? String {
-                return stringValue
-            } else if let intValue = param as? Int {
-                return Int64(intValue)
-            } else if let int64Value = param as? Int64 {
-                return int64Value
-            } else if let doubleValue = param as? Double {
-                return doubleValue
-            } else if let boolValue = param as? Bool {
-                return boolValue
-            }
-            return nil
-        } ?? []
-        
+
+        let bindingParams = parameters?.compactMap { anyToBinding($0) } ?? []
+
+        lock.lock()
+        defer { lock.unlock() }
+
         let statement = try db.prepare(sql, bindingParams)
         var results: [[String: Any]] = []
-        
         for row in statement {
             var dict: [String: Any] = [:]
             for (index, name) in statement.columnNames.enumerated() {
@@ -158,45 +140,52 @@ public final class SwiftLiteDB: @unchecked Sendable {
             }
             results.append(dict)
         }
-        
         return results
     }
-    
+
+    // MARK: - Internal Helpers
+
+    private func anyToBinding(_ value: Any) -> Binding? {
+        if let s = value as? String   { return s }
+        if let i = value as? Int      { return Int64(i) }
+        if let i = value as? Int64    { return i }
+        if let d = value as? Double   { return d }
+        if let b = value as? Bool     { return b }
+        if value is NSNull            { return nil }
+        return nil
+    }
+
     // MARK: - Debug Functions
-    
-    /// 印出資料庫位置和基本資訊
+
     public func printDatabaseLocation() {
         print("===== SwiftLiteDB Debug Info =====")
         print("Database Name: \(dbName)")
         print("Database Path: \(dbPath)")
         print("Database exists: \(FileManager.default.fileExists(atPath: dbPath))")
-        
+
         if let fileAttributes = try? FileManager.default.attributesOfItem(atPath: dbPath),
            let fileSize = fileAttributes[.size] as? Int64 {
             let fileSizeString = ByteCountFormatter.string(fromByteCount: fileSize, countStyle: .file)
             print("Database Size: \(fileSizeString)")
         }
-        
+
         print("Location Tracking: \(enableLocationTracking ? "Enabled" : "Disabled")")
         print("Logging: \(enableLogging ? "Enabled" : "Disabled")")
         print("Debug Mode: \(enableDebugMode ? "Enabled" : "Disabled")")
         print("==================================")
     }
-    
-    /// 取得資料庫中所有資料表資訊
+
     public func printAllTables() {
         print("===== Database Tables =====")
         do {
             let tables = try execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
-            
+
             if tables.isEmpty {
                 print("No user tables found in database")
             } else {
                 for (index, table) in tables.enumerated() {
                     if let tableName = table["name"] as? String {
                         print("\(index + 1). \(tableName)")
-                        
-                        // 如果啟用 debug 模式，印出表格結構
                         if enableDebugMode {
                             printTableInfo(tableName: tableName)
                         }
@@ -208,13 +197,12 @@ public final class SwiftLiteDB: @unchecked Sendable {
         }
         print("==========================")
     }
-    
-    /// 印出特定資料表的詳細資訊
+
     public func printTableInfo(tableName: String) {
         print("  ├─ Table: \(tableName)")
-        
+
         do {
-            // 取得表格結構
+            // PRAGMA and FROM clauses do not support ? bindings for identifiers — table name is from our own schema.
             let columns = try execute("PRAGMA table_info(\(tableName))")
             print("  ├─ Columns:")
             for column in columns {
@@ -223,33 +211,31 @@ public final class SwiftLiteDB: @unchecked Sendable {
                 let notNull = (column["notnull"] as? Int64) == 1 ? "NOT NULL" : ""
                 let pk = (column["pk"] as? Int64) == 1 ? "PRIMARY KEY" : ""
                 let defaultValue = column["dflt_value"] as? String ?? ""
-                
+
                 var columnInfo = "    ├─ \(name) \(type)"
                 if !notNull.isEmpty { columnInfo += " \(notNull)" }
                 if !pk.isEmpty { columnInfo += " \(pk)" }
                 if !defaultValue.isEmpty { columnInfo += " DEFAULT \(defaultValue)" }
-                
+
                 print(columnInfo)
             }
-            
-            // 取得記錄數量
+
             let countResult = try execute("SELECT COUNT(*) as count FROM \(tableName)")
             if let count = countResult.first?["count"] as? Int64 {
                 print("  └─ Row Count: \(count)")
             }
-            
+
         } catch {
             print("  └─ Error getting table info: \(error)")
         }
     }
-    
-    /// 開啟詳細調試模式
+
     public func enableDetailedDebug() {
         enableDebugMode = true
         enableLocationTracking = true
         enableLogging = true
-        
-        print("🔍 Detailed Debug Mode Enabled")
+
+        print("Detailed Debug Mode Enabled")
         printDatabaseLocation()
         printAllTables()
     }

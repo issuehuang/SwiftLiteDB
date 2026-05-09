@@ -22,23 +22,40 @@ public extension Model {
     func toDictionary() -> [String: Any] {
         let mirror = Mirror(reflecting: self)
         var dict: [String: Any] = [:]
-        
+
         for child in mirror.children {
             if let label = child.label {
-                // 只有在 id 不為 nil 或者不是 id 欄位時才加入
                 if label != "id" || self.id != nil {
-                    dict[label] = child.value
+                    dict[label] = Self.encodeValue(child.value)
                 }
             }
         }
-        
+
         return dict
     }
-    
+
     static func fromDictionary(_ dict: [String: Any]) throws -> Self {
         let jsonData = try JSONSerialization.data(withJSONObject: dict, options: [])
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
+        decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode(Self.self, from: jsonData)
+    }
+
+    /// Converts a value to a SQLite-storable type.
+    /// Handles Optional unwrapping, Date → ISO8601 String, UUID → String.
+    private static func encodeValue(_ value: Any) -> Any {
+        let mirror = Mirror(reflecting: value)
+        if mirror.displayStyle == .optional {
+            guard let unwrapped = mirror.children.first?.value else { return NSNull() }
+            return encodeValue(unwrapped)
+        }
+        if let date = value as? Date {
+            return ISO8601DateFormatter().string(from: date)
+        }
+        if let uuid = value as? UUID {
+            return uuid.uuidString
+        }
+        return value
     }
 }
