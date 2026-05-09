@@ -23,7 +23,8 @@ let package = Package(
         // Targets can depend on other targets in this package and products from dependencies.
         .target(
             name: "SwiftLiteDB",
-            dependencies: [.product(name: "SQLite", package: "SQLite.swift")]),
+            dependencies: [.product(name: "SQLite", package: "SQLite.swift")],
+            resources: [.copy("PrivacyInfo.xcprivacy")]),
         .testTarget(
             name: "SwiftLiteDBTests",
             dependencies: ["SwiftLiteDB"]
